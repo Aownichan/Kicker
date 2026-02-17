@@ -7,6 +7,7 @@ from collections import deque
 import math
 import json
 import os
+import socketio
 
 import numpy as np
 import cv2
@@ -91,7 +92,7 @@ def save_calibration(path: str):
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
-    print(f"✅ Saved calibration to {path}")
+    print(f"Saved calibration to {path}")
 
 def load_calibration(path: str) -> bool:
     if not os.path.exists(path):
@@ -121,10 +122,10 @@ def load_calibration(path: str) -> bool:
             # Backward compatibility: if you had RP/RN before, keep defaults
             print("ℹ️ Older calibration format detected. Loaded what we can, using defaults for CW/CCW.")
 
-        print(f"✅ Loaded calibration from {path}")
+        print(f"Loaded calibration from {path}")
         return True
     except Exception as e:
-        print("⚠️ Failed to load calibration:", e)
+        print("Failed to load calibration:", e)
         return False
 
 # =========================================================
@@ -723,6 +724,29 @@ def main():
         f"Settings: ANGLE_MARKER_MODE={ANGLE_MARKER_MODE}, ANGLE_SIGN={ANGLE_SIGN}, HEAD_AREA_MAX={HEAD_AREA_MAX}, PLAYER_GAP_V={PLAYER_GAP_V}\n"
     )
 
+    # -----------------------------
+    # Socket.IO producer connection
+    # -----------------------------
+    sio = socketio.Client(reconnection=True, reconnection_attempts=0, reconnection_delay=1)
+
+    @sio.event
+    def connect():
+        print("Connected to Socket.IO server")
+
+    @sio.event
+    def disconnect():
+        print("Disconnected from Socket.IO server")
+
+    try:
+        sio.connect("http://127.0.0.1:5000", wait_timeout=2)
+    except Exception as e:
+        print("Could not connect to server.py (is it running?) ->", e)
+        # Continue anyway; we'll just not emit until it connects
+
+    STREAM_HZ = 60.0
+    stream_period = 1.0 / STREAM_HZ
+    last_stream_time = 0.0
+
     try:
         while True:
             hdr, objs = read_consistent_snapshot(addr)
@@ -918,10 +942,18 @@ def main():
                 ],
             }
 
+            # --- Emit state to Socket.IO server at ~60Hz ---
             now = time.time()
-            if now - last_print > 1.0:
-                last_print = now
-                print(json.dumps(state, indent=2))
+            if M is not None and now - last_stream_time >= stream_period:
+                last_stream_time = now
+                if sio.connected:
+                    try:
+                        sio.emit("state", state)
+                    except Exception as e:
+                        # Don't crash tracking if network hiccups
+                        print("Emit failed:", e)
+
+            now = time.time()
 
             x0 = W_img - overlay_w - pad
             y0 = pad
@@ -969,7 +1001,7 @@ def main():
 
             if k == ord("l"):
                 fit_rod_lines_from_clusters(rod_clusters)
-                print("✅ Learned rod lines u=a*v+b")
+                print("Learned rod lines u=a*v+b")
                 print("A:", [f"{a:+.4f}" for a in ROD_LINE_A])
                 print("B:", [f"{b:+.4f}" for b in ROD_LINE_B])
 
@@ -979,14 +1011,14 @@ def main():
                     print("Cannot calibrate d0: not locked.")
                 else:
                     estimate_d0_const_from_clusters(rod_clusters)
-                    print("✅ SNAPSHOT d0 (upright). D0_B:", [f"{b:+.4f}" for b in D0_B])
+                    print("SNAPSHOT d0 (upright). D0_B:", [f"{b:+.4f}" for b in D0_B])
 
             if k == ord("9"):
                 if rod_map is None:
                     print("Cannot calibrate CW90: not locked.")
                 else:
                     estimate_R_const_for_pose(rod_clusters, pose="cw")
-                    print("✅ SNAPSHOT CW90. RCW_B:", [f"{b:.4f}" for b in RCW_B])
+                    print("SNAPSHOT CW90. RCW_B:", [f"{b:.4f}" for b in RCW_B])
                     print("   CW_SIGN:", [f"{s:+.0f}" for s in CW_SIGN])
 
             if k == ord("8"):
@@ -994,7 +1026,7 @@ def main():
                     print("Cannot calibrate CCW90: not locked.")
                 else:
                     estimate_R_const_for_pose(rod_clusters, pose="ccw")
-                    print("✅ SNAPSHOT CCW90. RCCW_B:", [f"{b:.4f}" for b in RCCW_B])
+                    print("SNAPSHOT CCW90. RCCW_B:", [f"{b:.4f}" for b in RCCW_B])
 
             # --- Recording (optional improvement) ---
             if k == ord("u"):
@@ -1003,7 +1035,7 @@ def main():
                         cal_d0_samples[ri].clear()
                     cal_mode = "d0"
                     cal_active = True
-                    print("🎥 START recording d0(v). Slide rods while UPRIGHT. Press 'u' again to STOP+FIT.")
+                    print("START recording d0(v). Slide rods while UPRIGHT. Press 'u' again to STOP+FIT.")
                 elif cal_mode == "d0":
                     cal_active = False
                     for ri in range(NUM_RODS):
@@ -1011,9 +1043,9 @@ def main():
                         if a is not None and b is not None:
                             D0_A[ri], D0_B[ri] = a, b
                     cal_mode = None
-                    print("✅ STOP d0(v). Fitted D0_A/D0_B.")
+                    print("STOP d0(v). Fitted D0_A/D0_B.")
                 else:
-                    print("⚠️ Another recording active. Stop it first.")
+                    print("Another recording active. Stop it first.")
 
             # record CW90 R(v)
             if k == ord("o"):
@@ -1023,7 +1055,7 @@ def main():
                         cal_cw_sign_samples[ri].clear()
                     cal_mode = "r_cw"
                     cal_active = True
-                    print("🎥 START recording CW90 R(v). Keep CW ~90° and slide rods. Press 'o' again to STOP+FIT.")
+                    print("START recording CW90 R(v). Keep CW ~90° and slide rods. Press 'o' again to STOP+FIT.")
                 elif cal_mode == "r_cw":
                     cal_active = False
                     for ri in range(NUM_RODS):
@@ -1034,10 +1066,10 @@ def main():
                         if cal_cw_sign_samples[ri]:
                             CW_SIGN[ri] = sign_nonzero(float(np.median(cal_cw_sign_samples[ri])))
                     cal_mode = None
-                    print("✅ STOP CW90 R(v). Fitted RCW_A/RCW_B and updated CW_SIGN.")
+                    print("STOP CW90 R(v). Fitted RCW_A/RCW_B and updated CW_SIGN.")
                     print("   CW_SIGN:", [f"{s:+.0f}" for s in CW_SIGN])
                 else:
-                    print("⚠️ Another recording active. Stop it first.")
+                    print("Another recording active. Stop it first.")
 
             # record CCW90 R(v)
             if k == ord("i"):
@@ -1046,7 +1078,7 @@ def main():
                         cal_rccw_samples[ri].clear()
                     cal_mode = "r_ccw"
                     cal_active = True
-                    print("🎥 START recording CCW90 R(v). Keep CCW ~90° and slide rods. Press 'i' again to STOP+FIT.")
+                    print("START recording CCW90 R(v). Keep CCW ~90° and slide rods. Press 'i' again to STOP+FIT.")
                 elif cal_mode == "r_ccw":
                     cal_active = False
                     for ri in range(NUM_RODS):
@@ -1054,9 +1086,9 @@ def main():
                         if a is not None and b is not None:
                             RCCW_A[ri], RCCW_B[ri] = a, b
                     cal_mode = None
-                    print("✅ STOP CCW90 R(v). Fitted RCCW_A/RCCW_B.")
+                    print("STOP CCW90 R(v). Fitted RCCW_A/RCCW_B.")
                 else:
-                    print("⚠️ Another recording active. Stop it first.")
+                    print("Another recording active. Stop it first.")
 
             if k == ord("s"):
                 print("=== Rod Lines u0(v)=A*v+B ===")
@@ -1086,6 +1118,11 @@ def main():
                 CloseHandle(hmap)
         except Exception as e:
             print("CloseHandle failed:", e)
+        try:
+            if sio.connected:
+                sio.disconnect()
+        except Exception:
+            pass    
 
 if __name__ == "__main__":
     main()
