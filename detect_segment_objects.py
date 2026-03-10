@@ -8,7 +8,7 @@ import math
 import json
 import os
 import socketio
-
+import websocket
 import numpy as np
 import cv2
 
@@ -670,7 +670,11 @@ def estimate_R_const_for_pose(rod_clusters_by_rod, pose: str):
 # Main
 # =========================================================
 
+ball_uv_smooth = None
+BALL_EMA = 0.2
+
 def main():
+    global ball_uv_smooth
     load_calibration(CALIB_FILE)
 
     show_uv_labels = False
@@ -747,6 +751,13 @@ def main():
     stream_period = 1.0 / STREAM_HZ
     last_stream_time = 0.0
 
+    ws = None
+    try:
+        ws = websocket.create_connection("ws://127.0.0.1:8765")
+        print("✅ Connected to WS producer server")
+    except Exception as e:
+        print("⚠️ Could not connect to WS producer server:", e)
+
     try:
         while True:
             hdr, objs = read_consistent_snapshot(addr)
@@ -822,6 +833,7 @@ def main():
             blobs_uv = []
             rod_clusters = {i: [] for i in range(NUM_RODS)}
             rod_state_angles = [None for _ in range(NUM_RODS)]  # always defined every frame
+            ball_uv = None
 
             if M is not None:
                 cv2.rectangle(ov, (10, 10), (overlay_w - 10, overlay_h - 10), (255, 255, 255), 1)
@@ -839,6 +851,22 @@ def main():
                             "area": tr.area, "radius": tr.radius,
                             "track_id": tr.track_id
                         })
+                
+                # Ball detection - largest blob above area threshold
+                BALL_AREA_MIN = 150.0
+                ball_candidates = [b for b in blobs_uv if b["area"] > BALL_AREA_MIN]
+                if ball_candidates:
+                    ball_blob = max(ball_candidates, key=lambda b: b["area"])
+                    ball_uv = (ball_blob["u"], ball_blob["v"])
+
+                if ball_uv is not None:
+                    if ball_uv_smooth is None:
+                        ball_uv_smooth = ball_uv
+                    else:
+                        ball_uv_smooth = (
+                            (1 - BALL_EMA) * ball_uv_smooth[0] + BALL_EMA * ball_uv[0],
+                            (1 - BALL_EMA) * ball_uv_smooth[1] + BALL_EMA * ball_uv[1],
+                        )
 
                 rod_map = assign_to_rods_by_known_x(blobs_uv, ROD_X, ROD_BAND_HALF_WIDTH)
 
@@ -857,6 +885,14 @@ def main():
                         cv2.putText(ov, f"{u:.2f},{v:.2f} a={b['area']:.0f}",
                                     (px + 3, py - 3),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1)
+
+                # Draw ball
+                if ball_uv is not None:
+                    bpx = int(10 + ball_uv[0] * (overlay_w - 20))
+                    bpy = int(10 + ball_uv[1] * (overlay_h - 20))
+                    cv2.circle(ov, (bpx, bpy), 6, (0, 255, 255), 2)  # cyan circle
+                    cv2.putText(ov, "BALL", (bpx + 7, bpy - 7),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)    
 
                 for ri in range(NUM_RODS):
                     rod_clusters[ri] = cluster_players_by_v(rod_map[ri], gap=PLAYER_GAP_V)
@@ -933,6 +969,15 @@ def main():
                             1
                         )
 
+            rod_players = []
+            for ri in range(NUM_RODS):
+                clusters = rod_clusters.get(ri, [])
+                players = []
+                for cl in clusters:
+                    v_med = float(np.median([bb["v"] for bb in cl]))
+                    players.append(v_med)
+                rod_players.append({"id": ri, "players": players})
+
             state = {
                 "t": float(hdr.timestamp_s),
                 "frame": int(hdr.frame_id),
@@ -940,18 +985,25 @@ def main():
                     {"id": ri, "angleDeg": (None if rod_state_angles[ri] is None else float(rod_state_angles[ri]))}
                     for ri in range(NUM_RODS)
                 ],
+                "rodPlayers": rod_players,
+                "ball": {
+                "u": float(ball_uv[0]) if ball_uv else None,
+                "v": float(ball_uv[1]) if ball_uv else None,
+                }
             }
+
+
 
             # --- Emit state to Socket.IO server at ~60Hz ---
             now = time.time()
             if M is not None and now - last_stream_time >= stream_period:
                 last_stream_time = now
-                if sio.connected:
+                if ws is not None:
                     try:
-                        sio.emit("state", state)
+                        ws.send(json.dumps(state))
                     except Exception as e:
-                        # Don't crash tracking if network hiccups
-                        print("Emit failed:", e)
+                        print("WS send failed:", e)
+                        ws = None
 
             now = time.time()
 
